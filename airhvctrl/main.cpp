@@ -1,5 +1,4 @@
 #include <ntddk.h>
-#include <intrin.h>
 #include "hypervisor_gateway.h"
 #include "utils.h"
 
@@ -50,7 +49,6 @@ VOID driver_unload(PDRIVER_OBJECT driver_object)
 	UNICODE_STRING dos_device_name;
 
 	hvgt::unhook_function(nt_create_file_address);
-	hvgt::dump_pool_manager();
 
 	RtlInitUnicodeString(&dos_device_name, L"\\DosDevices\\airhvctrl");
 	IoDeleteSymbolicLink(&dos_device_name);
@@ -125,6 +123,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver_object, PCUNICODE_STRING reg)
 
 	// Send information to hypervisor to allocate new pools
 	hvgt::send_irp_perform_allocation();
-	
+
 	return status;
 }

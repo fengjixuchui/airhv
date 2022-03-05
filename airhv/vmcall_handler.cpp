@@ -64,7 +64,7 @@ void vmexit_vmcall_handler(__vcpu* vcpu)
 
 	if (hv::get_guest_cpl() != 0) 
 	{
-		hv::inject_event(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
+		hv::inject_interruption(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
 		return;
 	}
 
@@ -86,7 +86,7 @@ void vmexit_vmcall_handler(__vcpu* vcpu)
 		{
 			 unsigned __int64 old_cr3 = hv::swap_context();
 
-			ept::hook_function((void*)vmcall_parameter1, (void*)vmcall_parameter2, (void*)vmcall_parameter3, (void**)vmcall_parameter4);
+			status = ept::hook_function((void*)vmcall_parameter1, (void*)vmcall_parameter2, (void*)vmcall_parameter3, (void**)vmcall_parameter4);
 
 			hv::restore_context(old_cr3);
 
@@ -143,6 +143,20 @@ void vmexit_vmcall_handler(__vcpu* vcpu)
 		case VMCALL_DUMP_VMCS_STATE:
 		{
 			hv::dump_vmcs();
+			adjust_rip(vcpu);
+			break;
+		}
+
+		case VMCALL_HIDE_HV_PRESENCE:
+		{
+			g_vmm_context->hv_presence = false;
+			adjust_rip(vcpu);
+			break;
+		}
+
+		case VMCALL_UNHIDE_HV_PRESENCE:
+		{
+			g_vmm_context->hv_presence = true;
 			adjust_rip(vcpu);
 			break;
 		}

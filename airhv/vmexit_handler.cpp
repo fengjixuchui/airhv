@@ -16,10 +16,13 @@
 #include "ia32\rflags.h"
 #include "ia32\dr.h"
 #include "invalidators.h"
+#include "xsave.h"
+#include "ia32\segment.h"
+#include "ia32\vmcs.h"
 
 void vmexit_ept_violation_handler(__vcpu* vcpu);
 void vmexit_unimplemented(__vcpu* vcpu);
-void vmexit_handle_exception(__vcpu* vcpu);
+void vmexit_exception_handler(__vcpu* vcpu);
 void vmexit_ept_violation_handler(__vcpu* vcpu);
 void vmexit_cr_handler(__vcpu* vcpu);
 void vmexit_vm_instruction(__vcpu* vcpu);
@@ -36,10 +39,14 @@ void vmexit_mov_dr_handler(__vcpu* vcpu);
 void vmexit_cpuid_handler(__vcpu* vcpu);
 void vmexit_msr_read_handler(__vcpu* vcpu);
 void vmexit_msr_write_handler(__vcpu* vcpu);
+void vmexit_invpcid_handler(__vcpu* vcpu);
+void vmexit_invlpg_handler(__vcpu* vcpu);
+void vmexit_ldtr_access_handler(__vcpu* vcpu);
+void vmexit_gdtr_access_handler(__vcpu* vcpu);
 
 void (*exit_handlers[EXIT_REASON_LAST])(__vcpu* guest_registers) =
 {
-	vmexit_handle_exception,						// 00 EXIT_REASON_EXCEPTION_NMI
+	vmexit_exception_handler,						// 00 EXIT_REASON_EXCEPTION_NMI
 	vmexit_unimplemented,							// 01 EXIT_REASON_EXTERNAL_INTERRUPT
 	vmexit_triple_fault_handler,					// 02 EXIT_REASON_TRIPLE_FAULT
 	vmexit_unimplemented,							// 03 EXIT_REASON_INIT_SIGNAL
@@ -53,7 +60,7 @@ void (*exit_handlers[EXIT_REASON_LAST])(__vcpu* guest_registers) =
 	vmexit_unimplemented,							// 11 EXIT_REASON_GETSEC
 	vmexit_unimplemented,							// 12 EXIT_REASON_HLT
 	vmexit_invd_handler,							// 13 EXIT_REASON_INVD
-	vmexit_unimplemented,							// 14 EXIT_REASON_INVLPG
+	vmexit_invlpg_handler,							// 14 EXIT_REASON_INVLPG
 	vmexit_unimplemented,							// 15 EXIT_REASON_RDPMC
 	vmexit_rdtsc_handler,							// 16 EXIT_REASON_RDTSC
 	vmexit_unimplemented,							// 17 EXIT_REASON_RSM
@@ -85,8 +92,8 @@ void (*exit_handlers[EXIT_REASON_LAST])(__vcpu* guest_registers) =
 	vmexit_unimplemented,							// 43 EXIT_REASON_TPR_BELOW_THRESHOLD
 	vmexit_unimplemented,							// 44 EXIT_REASON_APIC_ACCESS 
 	vmexit_unimplemented,							// 45 EXIT_REASON_VIRTUALIZED_EIO
-	vmexit_unimplemented,							// 46 EXIT_REASON_ACCESS_TO_GDTR_OR_IDTR
-	vmexit_unimplemented,							// 47 EXIT_REASON_ACCESS_TO_LDTR_OR_TR
+	vmexit_gdtr_access_handler,						// 46 EXIT_REASON_ACCESS_TO_GDTR_OR_IDTR
+	vmexit_ldtr_access_handler,						// 47 EXIT_REASON_ACCESS_TO_LDTR_OR_TR
 	vmexit_ept_violation_handler,					// 48 EXIT_REASON_EPT_VIOLATION
 	vmexit_failed,									// 49 EXIT_REASON_EPT_MISCONFIGURATION
 	vmexit_vm_instruction,							// 50 EXIT_REASON_INVEPT
@@ -97,7 +104,7 @@ void (*exit_handlers[EXIT_REASON_LAST])(__vcpu* guest_registers) =
 	vmexit_xsetbv_handler,							// 55 EXIT_REASON_XSETBV
 	vmexit_unimplemented,							// 56 EXIT_REASON_APIC_WRITE
 	vmexit_rdrand_handler,							// 57 EXIT_REASON_RDRAND
-	vmexit_unimplemented,							// 58 EXIT_REASON_INVPCID
+	vmexit_invpcid_handler,							// 58 EXIT_REASON_INVPCID
 	vmexit_vm_instruction,							// 59 EXIT_REASON_VMFUNC
 	vmexit_unimplemented,							// 60 EXIT_REASON_ENCLS
 	vmexit_rdseed_handler,							// 61 EXIT_REASON_RDSEED
@@ -111,6 +118,155 @@ void (*exit_handlers[EXIT_REASON_LAST])(__vcpu* guest_registers) =
 };
 
 /// <summary>
+/// sgdt,sidt,lgdt,lidt handler
+/// </summary>
+/// <param name="guest_regs"></param>
+void vmexit_gdtr_access_handler(__vcpu* vcpu)
+{
+	__vmexit_instruction_information3 instruction_information = { vcpu->vmexit_info.instruction_information };
+
+	union __tmp_desc
+	{
+		__pseudo_descriptor64 desc64;
+		__pseudo_descriptor32 desc32;
+	};
+
+	__tmp_desc* tmp_desc = (__tmp_desc*)hv::get_guest_address(vcpu);
+
+	unsigned __int64 old_cr3 = hv::swap_context();
+
+	switch (instruction_information.instruction_identity)
+	{
+		// SGDT
+		case 0:
+		{
+			__segment_selector selector;
+			selector.all = hv::vmread(GUEST_CS_SELECTOR);
+
+			__segment_descriptor* segment_desc = (__segment_descriptor*)(hv::vmread(GUEST_GDTR_BASE) + selector.index * 8);
+
+			if (segment_desc->long_mode == 1)
+			{
+				tmp_desc->desc64.base_address = hv::vmread(GUEST_GDTR_BASE);
+				tmp_desc->desc64.limit = hv::vmread(GUEST_GDTR_LIMIT);
+			}
+
+			else 
+			{
+				tmp_desc->desc32.base_address = hv::vmread(GUEST_GDTR_BASE);
+				tmp_desc->desc32.limit = hv::vmread(GUEST_GDTR_LIMIT);
+			}
+
+			break;
+		}
+
+		// SIDT
+		case 1:
+		{
+			__segment_selector selector;
+			selector.all = hv::vmread(GUEST_CS_SELECTOR);
+
+			__segment_descriptor* segment_desc = (__segment_descriptor*)(hv::vmread(GUEST_GDTR_BASE) + selector.index * 8);
+
+			if (segment_desc->long_mode == 1)
+			{
+				tmp_desc->desc64.base_address = hv::vmread(GUEST_IDTR_BASE);
+				tmp_desc->desc64.limit = hv::vmread(GUEST_IDTR_LIMIT);
+			}
+
+			else
+			{
+				tmp_desc->desc32.base_address = hv::vmread(GUEST_IDTR_BASE);
+				tmp_desc->desc32.limit = hv::vmread(GUEST_IDTR_LIMIT);
+			}
+
+			break;
+		}
+
+		// LGDT
+		case 2:
+		{
+			hv::vmwrite(GUEST_GDTR_BASE, tmp_desc->desc64.base_address);
+			hv::vmwrite(GUEST_GDTR_LIMIT, tmp_desc->desc64.limit);
+
+			break;
+		}
+
+		// LIDT
+		case 3:
+		{
+			hv::vmwrite(GUEST_IDTR_BASE, tmp_desc->desc64.base_address);
+			hv::vmwrite(GUEST_IDTR_LIMIT, tmp_desc->desc64.limit);
+
+			break;
+		}
+	}
+
+	hv::restore_context(old_cr3);
+
+	adjust_rip(vcpu);
+}
+
+/// <summary>
+/// sldt,str,lldt,ltr handler
+/// </summary>
+/// <param name="guest_regs"></param>
+void vmexit_ldtr_access_handler(__vcpu* vcpu)
+{
+	__vmexit_instruction_information4 instruction_information = { vcpu->vmexit_info.instruction_information };
+	unsigned __int64* linear_address = 
+		instruction_information.mem_reg ? 
+		&vcpu->vmexit_info.guest_registers->rax - instruction_information.reg1 : 
+		(unsigned __int64*)hv::get_guest_address(vcpu);
+
+	unsigned __int64 old_cr3 = hv::swap_context();
+
+	switch (instruction_information.instruction_identity)
+	{
+		// SLDT
+		case 0:
+		{
+			*linear_address = hv::vmread(GUEST_LDTR_SELECTOR);
+
+			break;
+		}
+
+		// STR
+		case 1:
+		{
+			*linear_address = hv::vmread(GUEST_TR_SELECTOR);
+
+			break;
+		}
+
+		// LLDT
+		case 2:
+		{
+			hv::vmwrite(GUEST_LDTR_SELECTOR, *linear_address);
+
+			break;
+		}
+
+		// LTR
+		case 3:
+		{
+			hv::vmwrite(GUEST_TR_SELECTOR, *linear_address);
+
+			__segment_selector selector;
+			selector.all = *linear_address;
+			__segment_descriptor* segment_desc = (__segment_descriptor*)(hv::vmread(GUEST_GDTR_BASE) + selector.index * 8);
+			segment_desc->type |= 2;
+
+			break;
+		}
+	}
+
+	hv::restore_context(old_cr3);
+
+	adjust_rip(vcpu);
+}
+
+/// <summary>
 /// Msr read handler
 /// </summary>
 /// <param name="guest_regs"></param>
@@ -119,97 +275,63 @@ void vmexit_msr_read_handler(__vcpu* vcpu)
 	__msr msr;
 	unsigned __int64 msr_index = vcpu->vmexit_info.guest_registers->rcx;
 
-	if (msr_index >= SYNTHETHIC_MSR_LOW && msr_index <= SYNTHETHIC_MSR_HI)
-	{
-		hv::inject_event(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
-		return;
-	}
-
 	switch (msr_index)
 	{
 		case IA32_INTERRUPT_SSP_TABLE_ADDR:
-		{
 			msr.all = hv::vmread(GUEST_INTERRUPT_SSP_TABLE_ADDR);
 			break;
-		}
 
 		case IA32_SYSENTER_CS:
-		{
 			msr.all = hv::vmread(GUEST_SYSENTER_CS);
 			break;
-		}
 
 		case IA32_SYSENTER_EIP:
-		{
 			msr.all = hv::vmread(GUEST_SYSENTER_EIP);
 			break;
-		}
 
 		case IA32_SYSENTER_ESP:
-		{
 			msr.all = hv::vmread(GUEST_SYSENTER_ESP);
 			break;
-		}
 
 		case IA32_S_CET:
-		{
 			msr.all = hv::vmread(GUEST_S_CET);
 			break;
-		}
 
 		case IA32_PERF_GLOBAL_CTRL:
-		{
 			msr.all = hv::vmread(GUEST_PERF_GLOBAL_CONTROL);
 			break;
-		}
 
 		case IA32_PKRS:
-		{
 			msr.all = hv::vmread(GUEST_PKRS);
 			break;
-		}
 
 		case IA32_RTIT_CTL:
-		{
 			msr.all = hv::vmread(GUEST_RTIT_CTL);
 			break;
-		}
 
 		case IA32_BNDCFGS:
-		{
 			msr.all = hv::vmread(GUEST_BNDCFGS);
 			break;
-		}
 
 		case IA32_PAT:
-		{
 			msr.all = hv::vmread(GUEST_PAT);
 			break;
-		}
 
 		case IA32_EFER:
-		{
 			msr.all = hv::vmread(GUEST_EFER);
 			break;
-		}
 
 		case IA32_GS_BASE:
-		{
 			msr.all = hv::vmread(GUEST_GS_BASE);
 			break;
-		}
 
 		case IA32_FS_BASE:
-		{
 			msr.all = hv::vmread(GUEST_FS_BASE);
 			break;
-		}
 
 		default:
-		{
 			msr.all = __readmsr(msr_index);
 			break;
-		}
 	}
 
 	vcpu->vmexit_info.guest_registers->rdx = msr.high;
@@ -224,104 +346,69 @@ void vmexit_msr_read_handler(__vcpu* vcpu)
 /// <param name="guest_regs"></param>
 void vmexit_msr_write_handler(__vcpu* vcpu)
 {
-	__msr msr;
 	unsigned __int64 msr_index = vcpu->vmexit_info.guest_registers->rcx;
 
-	if (msr_index >= SYNTHETHIC_MSR_LOW && msr_index <= SYNTHETHIC_MSR_HI)
-	{
-		hv::inject_event(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
-		return;
-	}
-
+	__msr msr;
 	msr.high = vcpu->vmexit_info.guest_registers->rdx;
 	msr.low = vcpu->vmexit_info.guest_registers->rax;
 
 	switch (msr_index)
 	{
 		case IA32_INTERRUPT_SSP_TABLE_ADDR:
-		{
 			hv::vmwrite(GUEST_INTERRUPT_SSP_TABLE_ADDR, msr.all);
 			break;
-		}
 
 		case IA32_SYSENTER_CS:
-		{
 			hv::vmwrite(GUEST_SYSENTER_CS, msr.all);
 			break;
-		}
-
 
 		case IA32_SYSENTER_EIP:
-		{
 			hv::vmwrite(GUEST_SYSENTER_EIP, msr.all);
 			break;
-		}
 
 		case IA32_SYSENTER_ESP:
-		{
 			hv::vmwrite(GUEST_SYSENTER_ESP, msr.all);
 			break;
-		}
 
 		case IA32_S_CET:
-		{
 			hv::vmwrite(GUEST_S_CET, msr.all);
 			break;
-		}
 
 		case IA32_PERF_GLOBAL_CTRL:
-		{
 			hv::vmwrite(GUEST_PERF_GLOBAL_CONTROL, msr.all);
 			break;
-		}
 
 		case IA32_PKRS:
-		{
 			hv::vmwrite(GUEST_PKRS, msr.all);
 			break;
-		}
 
 		case IA32_RTIT_CTL:
-		{
 			hv::vmwrite(GUEST_RTIT_CTL, msr.all);
 			break;
-		}
 
 		case IA32_BNDCFGS:
-		{
 			hv::vmwrite(GUEST_BNDCFGS, msr.all);
 			break;
-		}
 
 		case IA32_PAT:
-		{
 			hv::vmwrite(GUEST_PAT, msr.all);
 			break;
-		}
 
 		case IA32_EFER:
-		{
 			hv::vmwrite(GUEST_EFER, msr.all);
 			break;
-		}
 
 		case IA32_GS_BASE:
-		{
 			hv::vmwrite(GUEST_GS_BASE, msr.all);
 			break;
-		}
 
 		case IA32_FS_BASE:
-		{
 			hv::vmwrite(GUEST_FS_BASE, msr.all);
 			break;
-		}
 
 		default:
-		{
 			__writemsr(msr_index, msr.all);
 			break;
-		}
 	}
 
 	adjust_rip(vcpu);
@@ -360,22 +447,18 @@ void vmexit_ept_violation_handler(__vcpu* vcpu)
 /// Exception handler
 /// </summary>
 /// <param name="guest_reg"></param>
-void vmexit_handle_exception(__vcpu* vcpu)
+void vmexit_exception_handler(__vcpu* vcpu)
 {
 	__vmexit_interrupt_info interrupt_info;
 	interrupt_info.all = hv::vmread(VM_EXIT_INTERRUPTION_INFORMATION);
+	
+	unsigned __int32 error_code = hv::vmread(VM_EXIT_INTERRUPTION_ERROR_CODE);
 
-	unsigned __int32 error_code = hv::vmread(CONTROL_VM_ENTRY_EXCEPTION_ERROR_CODE);
-
-	// Page fault it treated not like any other exception
 	// Exit Qualification contain the linear address which caused page fault
 	if (interrupt_info.vector == EXCEPTION_VECTOR_PAGE_FAULT)
-	{
-		unsigned __int64 linear_address = vcpu->vmexit_info.qualification;
-		__writecr2(linear_address);
-	}
+		__writecr2(vcpu->vmexit_info.qualification);
 
-	hv::inject_event(interrupt_info.vector, interrupt_info.interruption_type, error_code, interrupt_info.error_code_valid);
+	hv::inject_interruption(interrupt_info.vector, interrupt_info.interruption_type, error_code, interrupt_info.error_code_valid);
 }
 
 /// <summary>
@@ -386,33 +469,46 @@ void vmexit_cpuid_handler(__vcpu* vcpu)
 {
 	__cpuid_info cpuid_reg = { 0 };
 
-	// these cpuids aren't implemented
-	if (!(vcpu->vmexit_info.guest_registers->rax >= 0x4000000 && vcpu->vmexit_info.guest_registers->rax <= 0x4FFFFFFF))
-	{
+	if (g_vmm_context->hv_presence == false &&
+		vcpu->vmexit_info.guest_registers->rax >= 0x40000000 &&
+		vcpu->vmexit_info.guest_registers->rax <= 0x4FFFFFFF)
+		__cpuidex((int*)&cpuid_reg.eax, g_vmm_context->highest_basic_leaf, 0);
+
+	else 
 		__cpuidex((int*)&cpuid_reg.eax, vcpu->vmexit_info.guest_registers->rax, vcpu->vmexit_info.guest_registers->rcx);
-	}
 
-	if (vcpu->vmexit_info.guest_registers->rax == CPUID_PROCESSOR_FEATURES)
-	{
-		// Hypervisor present bit
-		cpuid_reg.cpuid_eax_01.feature_information_ecx.hypervisor_present = true;
-	}
 
-	else if (vcpu->vmexit_info.guest_registers->rax == CPUID_HV_VENDOR_AND_MAX_FUNCTIONS)
+	switch (vcpu->vmexit_info.guest_registers->rax)
 	{
-		cpuid_reg.eax = CPUID_HV_INTERFACE;
-		cpuid_reg.ebx = 'hria';  // airhv
-		cpuid_reg.ecx = 'v\x00\x00\x00';
-		cpuid_reg.edx = 0;
-	}
+		case CPUID_PROCESSOR_FEATURES:
+			cpuid_reg.cpuid_eax_01.feature_information_ecx.hypervisor_present = g_vmm_context->hv_presence; // Hypervisor present bit
+			break;
+		
+		case CPUID_HV_VENDOR_AND_MAX_FUNCTIONS:
+			if (g_vmm_context->hv_presence == true)
+			{
+				cpuid_reg.eax = CPUID_HV_INTERFACE;
+				cpuid_reg.ebx = 'hria';  // airhv
+				cpuid_reg.ecx = 'v\x00\x00\x00';
+				cpuid_reg.edx = 0;
+			}
+			break;
 
-	else if (vcpu->vmexit_info.guest_registers->rax == CPUID_HV_INTERFACE)
-	{
-		//
-		// This indicates that our hypervisor doesn't conform to microsoft hyperv interaface
-		//
-		cpuid_reg.eax = '0#vH';
-		cpuid_reg.ebx = cpuid_reg.ecx = cpuid_reg.edx = 0;
+		case CPUID_HV_INTERFACE:
+			if (g_vmm_context->hv_presence == true)
+			{
+				//
+				// This indicates that our hypervisor doesn't conform to microsoft hyperv interaface
+				//
+				cpuid_reg.eax = '0#vH';
+				cpuid_reg.ebx = cpuid_reg.ecx = cpuid_reg.edx = 0;
+			}
+			break;
+
+		case CPUID_EXTENDED_FEATURES:
+			if (vcpu->vmexit_info.guest_registers->rcx == 0)
+				CLR_CPUID_BIT(cpuid_reg.ecx, 5); // TPAUSE UMONITOR and UWAIT are not supported
+			break;
 	}
 
 	vcpu->vmexit_info.guest_registers->rax = cpuid_reg.eax;
@@ -429,16 +525,13 @@ void vmexit_cpuid_handler(__vcpu* vcpu)
 /// <param name="guest_registers"></param>
 void vmexit_invpcid_handler(__vcpu* vcpu) 
 {
-	__vmexit_instruction_information2 instruction_information;
-	__invpcid_descriptor descriptor;
+	__vmexit_instruction_information2 instruction_information = { vcpu->vmexit_info.instruction_information };
 
-	instruction_information.all = vcpu->vmexit_info.instruction_information;
+	unsigned __int64* type = &vcpu->vmexit_info.guest_registers->rax - instruction_information.reg2;
 
-	unsigned __int64* invpcid_type = &vcpu->vmexit_info.guest_registers->rax - instruction_information.index_reg;
-
-	if (*invpcid_type > 3) 
+	if (*type > INVPCID_ALL_CONTEXTS_EXCEPT_GLOBAL_TRANSLATIONS)
 	{
-		hv::inject_event(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
+		hv::inject_interruption(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, true);
 		return;
 	}
 
@@ -448,34 +541,55 @@ void vmexit_invpcid_handler(__vcpu* vcpu)
 
 	if (MmGetPhysicalAddress((void*)guest_address).QuadPart == 0) 
 	{
-		hv::inject_event(EXCEPTION_VECTOR_PAGE_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
+		__writecr2(guest_address);
+		hv::inject_interruption(EXCEPTION_VECTOR_PAGE_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, true);
 		hv::restore_context(old_cr3);
 		return;
 	}
 
+	__invpcid_descriptor descriptor;
 	memcpy(&descriptor, (void*)guest_address, sizeof(descriptor));
 
 	hv::restore_context(old_cr3);
 
 	if(descriptor.reserved != 0)
 	{
-		hv::inject_event(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
+		hv::inject_interruption(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, true);
 		return;
 	}
 
-	if ((*invpcid_type == 0 || *invpcid_type == 1) && descriptor.pcid != 0) 
+	__cr4 cr4 = { __readcr4() };
+
+	if ((*type == INVPCID_INVIDUAL_ADDRESS || *type == INVPCID_SINGLE_CONTEXT) && descriptor.pcid != 0 && cr4.pcid_enable == false)
 	{
-		hv::inject_event(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
+		hv::inject_interruption(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, true);
 		return;
 	}
 
-	if (*invpcid_type == 0 && hv::is_address_canonical(descriptor.linear_address)) 
+	if (*type == INVPCID_INVIDUAL_ADDRESS && !hv::is_address_canonical(descriptor.linear_address))
 	{
-		hv::inject_event(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
+		hv::inject_interruption(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, true);
 		return;
 	}
 
-	_invpcid(*invpcid_type, &descriptor);
+	if (*type == INVPCID_INVIDUAL_ADDRESS)
+		invvpid_invidual_address(descriptor.linear_address, 1);
+
+	else if (*type == INVPCID_SINGLE_CONTEXT)
+		invvpid_single_context(1);
+
+	else if (*type == INVPCID_ALL_CONTEXTS)
+		invvpid_single_context(1);
+
+	else if (*type == INVPCID_ALL_CONTEXTS_EXCEPT_GLOBAL_TRANSLATIONS)
+		invvpid_single_context_except_global_translations(1);
+
+	adjust_rip(vcpu);
+}
+
+void vmexit_invlpg_handler(__vcpu* vcpu)
+{
+	invvpid_invidual_address(vcpu->vmexit_info.qualification, 1);
 
 	adjust_rip(vcpu);
 }
@@ -499,7 +613,7 @@ void vmexit_mov_dr_handler(__vcpu* vcpu)
 	//
 	if (hv::get_guest_cpl() != 0) 
 	{
-		hv::inject_event(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
+		hv::inject_interruption(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, true);
 		return;
 	}
 
@@ -518,7 +632,7 @@ void vmexit_mov_dr_handler(__vcpu* vcpu)
 
 		if (cr4.debugging_extensions == true) 
 		{
-			hv::inject_event(EXCEPTION_VECTOR_UNDEFINED_OPCODE, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
+			hv::inject_interruption(EXCEPTION_VECTOR_UNDEFINED_OPCODE, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, false);
 			return;
 		}
 
@@ -530,7 +644,7 @@ void vmexit_mov_dr_handler(__vcpu* vcpu)
 	//
 	if ((operation.debug_register_number == 6 || operation.debug_register_number == 7) && operation.access_direction == 0 && (*gp_register >> 32) != 0) 
 	{
-		hv::inject_event(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
+		hv::inject_interruption(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, true);
 		return;
 	}
 
@@ -552,7 +666,7 @@ void vmexit_mov_dr_handler(__vcpu* vcpu)
 
 		hv::vmwrite<unsigned __int64>(GUEST_DR7, dr7.all);
 
-		hv::inject_event(EXCEPTION_VECTOR_SINGLE_STEP, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
+		hv::inject_interruption(EXCEPTION_VECTOR_SINGLE_STEP, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, false);
 		return;
 	}
 
@@ -632,9 +746,8 @@ void vmexit_mov_dr_handler(__vcpu* vcpu)
 void vmexit_io(__vcpu* vcpu)
 {
 	__exit_qualification_io io_information;
-	__rflags rflags;
+	__rflags rflags = vcpu->vmexit_info.guest_rflags;
 
-	rflags.all = vcpu->vmexit_info.guest_rflags;
 	io_information.all = vcpu->vmexit_info.qualification;
 
 	union
@@ -660,7 +773,8 @@ void vmexit_io(__vcpu* vcpu)
 
 		if (physcial_address == 0)
 		{
-			hv::inject_event(EXCEPTION_VECTOR_PAGE_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
+			__writecr2(port_value.qword);
+			hv::inject_interruption(EXCEPTION_VECTOR_PAGE_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, true);
 			return;
 		}
 	}
@@ -795,14 +909,12 @@ void vmexit_io_handler(__vcpu* vcpu)
 /// <param name="guest_registers"></param>
 void vmexit_rdrand_handler(__vcpu* vcpu)
 {
-	__rflags rflags;
+	__rflags rflags = vcpu->vmexit_info.guest_rflags;
 	__vmexit_instruction_information5 instruction_information;
 
 	instruction_information.all = vcpu->vmexit_info.instruction_information;
 
 	unsigned __int64* register_pointer = &vcpu->vmexit_info.guest_registers->rax - instruction_information.operand_register;
-
-	rflags.all = vcpu->vmexit_info.guest_rflags;
 
 	//
 	// Loads a hardware generated random value and store it in the destination register.
@@ -847,14 +959,12 @@ void vmexit_rdrand_handler(__vcpu* vcpu)
 /// <param name="guest_registers"></param>
 void vmexit_rdseed_handler(__vcpu* vcpu)
 {
-	__rflags rflags;
+	__rflags rflags = vcpu->vmexit_info.guest_rflags;
 	__vmexit_instruction_information5 instruction_information;
 	
 	instruction_information.all = vcpu->vmexit_info.instruction_information;
 
 	unsigned __int64*  register_pointer = &vcpu->vmexit_info.guest_registers->rax - instruction_information.operand_register;
-
-	rflags.all = vcpu->vmexit_info.guest_rflags;
 
 	//
 	// Loads a hardware generated random value and store it in the destination register.
@@ -933,7 +1043,7 @@ void vmexit_xsetbv_handler(__vcpu* vcpu)
 		new_xcr0.reserved3 != current_xcr0.reserved3 || 
 		(new_xcr0.avx == 1 && new_xcr0.sse == 0))
 	{
-		hv::inject_event(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
+		hv::inject_interruption(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, true);
 		return;
 	}
 
@@ -1020,7 +1130,7 @@ void vmexit_unimplemented(__vcpu* vcpu)
 void vmexit_vm_instruction(__vcpu* vcpu)
 {
 	UNREFERENCED_PARAMETER(vcpu);
-	hv::inject_event(EXCEPTION_VECTOR_UNDEFINED_OPCODE, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
+	hv::inject_interruption(EXCEPTION_VECTOR_UNDEFINED_OPCODE, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, false);
 }
 
 /// <summary>
@@ -1033,8 +1143,8 @@ void vmexit_triple_fault_handler(__vcpu* vcpu)
 	// Dump whole vmcs state before hard reset
 	//
 	UNREFERENCED_PARAMETER(vcpu);
-	ASSERT(FALSE);
 	hv::dump_vmcs();
+	ASSERT(FALSE);
 	hv::hard_reset();
 }
 
@@ -1052,6 +1162,7 @@ void vmexit_rdtsc_handler(__vcpu* vcpu)
 	// See "Time Stamp Counter" in Chapter 15 of the IA-32 Intel Architecture Software Developer's Manual, 
 	// Volume 3 for specific details of the time stamp counter behavior.
 	//
+
 	unsigned __int64 tsc = __rdtsc();
 
 	vcpu->vmexit_info.guest_registers->rdx = MASK_GET_HIGHER_32BITS(tsc) >> 32;
@@ -1118,7 +1229,7 @@ void vmexit_cr_handler(__vcpu* vcpu)
 					// Any attempt to clear cr0 PG bit cause #GP
 					if (cr_registers.cr0.paging_enable == 0)
 					{
-						hv::inject_event(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
+						hv::inject_interruption(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, true);
 						return;
 					}
 
@@ -1135,12 +1246,13 @@ void vmexit_cr_handler(__vcpu* vcpu)
 					//
 					if (cr_registers.cr3.reserved_1 != 0 || cr_registers.cr3.reserved_2 != 0) 
 					{
-						hv::inject_event(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
+						hv::inject_interruption(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, true);
 						return;
 					}
 
 					hv::vmwrite<unsigned __int64>(GUEST_CR3, (*register_pointer & ~(1ULL << 63)));
-					invvpid_all_contexts();
+
+					invvpid_single_context_except_global_translations(1);
 					break;
 				}
 
@@ -1157,7 +1269,7 @@ void vmexit_cr_handler(__vcpu* vcpu)
 						cr_registers.cr4.reserved_3 != 0 || cr_registers.cr4.physical_address_extension == 0 ||
 						(cr_registers.cr4.pcid_enable == 1 && guest_cr3.pcid != 0))
 					{
-						hv::inject_event(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, 1);
+						hv::inject_interruption(EXCEPTION_VECTOR_GENERAL_PROTECTION_FAULT, INTERRUPT_TYPE_HARDWARE_EXCEPTION, 0, true);
 						return;
 					}
 
@@ -1183,19 +1295,19 @@ void vmexit_cr_handler(__vcpu* vcpu)
 			{
 				case 0:
 				{
-					__vmx_vmread(GUEST_CR0, register_pointer);
+					*register_pointer = hv::vmread(GUEST_CR0);
 					break;
 				}
 
 				case 3:
 				{
-					__vmx_vmread(GUEST_CR3, register_pointer);
+					*register_pointer = hv::vmread(GUEST_CR3);
 					break;
 				}
 
 				case 4:
 				{
-					__vmx_vmread(GUEST_CR4, register_pointer);
+					*register_pointer = hv::vmread(GUEST_CR4);
 					break;
 				}
 
@@ -1306,11 +1418,12 @@ void vmexit_cr_handler(__vcpu* vcpu)
 bool vmexit_handler(__vmexit_guest_registers* guest_registers)
 {
 	__vcpu* vcpu = g_vmm_context->vcpu_table[KeGetCurrentProcessorNumber()];
+
 	guest_registers->rsp = hv::vmread(GUEST_RSP);
 
 	vcpu->vmexit_info.reason = hv::vmread(EXIT_REASON) & 0xffff;
 	vcpu->vmexit_info.qualification = hv::vmread(EXIT_QUALIFICATION);
-	vcpu->vmexit_info.guest_rflags = hv::vmread(GUEST_RFLAGS);
+	vcpu->vmexit_info.guest_rflags.all = hv::vmread(GUEST_RFLAGS);
 	vcpu->vmexit_info.guest_rip = hv::vmread(GUEST_RIP);
 	vcpu->vmexit_info.instruction_length = hv::vmread(VM_EXIT_INSTRUCTION_LENGTH);
 	vcpu->vmexit_info.instruction_information = hv::vmread(VM_EXIT_INSTRUCTION_INFORMATION);
@@ -1338,5 +1451,17 @@ bool vmexit_handler(__vmexit_guest_registers* guest_registers)
 /// </summary>
 void adjust_rip(__vcpu* vcpu)
 {
-	__vmx_vmwrite(GUEST_RIP, vcpu->vmexit_info.guest_rip + vcpu->vmexit_info.instruction_length);
+	hv::vmwrite(GUEST_RIP, vcpu->vmexit_info.guest_rip + vcpu->vmexit_info.instruction_length);
+	if (vcpu->vmexit_info.guest_rflags.trap_flag)
+	{
+		__vmx_pending_debug_exceptions pending_debug = { hv::vmread(GUEST_PENDING_DEBUG_EXCEPTION) };
+		__vmx_interruptibility_state interruptibility = { hv::vmread(GUEST_INTERRUPTIBILITY_STATE) };
+
+		pending_debug.bs = true;
+		hv::vmwrite(GUEST_PENDING_DEBUG_EXCEPTION, pending_debug.all);
+
+		interruptibility.blocking_by_sti = false;
+		interruptibility.blocking_by_mov_ss = false;
+		hv::vmwrite(GUEST_INTERRUPTIBILITY_STATE, interruptibility.all);
+	}
 }

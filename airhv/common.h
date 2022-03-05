@@ -4,6 +4,7 @@
 #include "poolmanager.h"
 #include "ia32\exception.h"
 #include "ia32\mtrr.h"
+#include "ia32\rflags.h"
 
 extern "C" size_t __fastcall LDE(const void* lpData, unsigned int size);
 
@@ -44,8 +45,9 @@ struct __vmexit_guest_registers
 struct __ept_state
 {
     LIST_ENTRY hooked_page_list;
-    __mtrr_range_descriptor memory_range[9];
+    __mtrr_range_descriptor memory_range[100];
     unsigned __int32 enabled_memory_ranges;
+    unsigned __int8 default_memory_type;
     __eptp* ept_pointer;
     __vmm_ept_page_table* ept_page_table;
     volatile long pml_lock;
@@ -82,7 +84,7 @@ struct __vcpu
 
         unsigned __int64 guest_rip;
 
-        unsigned __int64 guest_rflags;
+       __rflags guest_rflags;
 
         unsigned __int64 instruction_length;
 
@@ -127,6 +129,8 @@ struct __vmm_context
     __ept_state* ept_state;
 
     unsigned __int32 processor_count;
+    unsigned __int32 highest_basic_leaf;
+    bool hv_presence;
 };
 
 extern __vmm_context* g_vmm_context;

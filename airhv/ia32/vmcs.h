@@ -32,7 +32,7 @@ union __vmx_secondary_processor_based_control
         unsigned __int64 intel_pt_uses_guest_physical_address : 1;
         unsigned __int64 use_tsc_scaling : 1;
         unsigned __int64 enable_user_wait_and_pause : 1;
-        unsigned __int64 enablde_enclv_exiting : 1;
+        unsigned __int64 enable_enclv_exiting : 1;
     };
 };
 
@@ -162,6 +162,40 @@ union __vmx_exit_control
         unsigned __int64 load_ia32_rtit_ctl : 1;
         unsigned __int64 load_cet_state : 1;
         unsigned __int64 load_pkrs : 1;
+    };
+};
+
+union __vmx_pending_debug_exceptions 
+{
+    unsigned __int64 all;
+    struct
+    {
+        unsigned __int64 b0 : 1;
+        unsigned __int64 b1 : 1;
+        unsigned __int64 b2 : 1;
+        unsigned __int64 b3 : 1;
+        unsigned __int64 reserved1 : 8;
+        unsigned __int64 enabled_bp : 1;
+        unsigned __int64 reserved2 : 1;
+        unsigned __int64 bs : 1;
+        unsigned __int64 reserved3 : 1;
+        unsigned __int64 rtm : 1;
+        unsigned __int64 reserved4 : 47;
+    };
+
+};
+
+union __vmx_interruptibility_state
+{
+    unsigned __int64 all;
+    struct
+    {
+        unsigned __int64 blocking_by_sti : 1;
+        unsigned __int64 blocking_by_mov_ss : 1;
+        unsigned __int64 blocking_by_smi : 1;
+        unsigned __int64 blocking_by_nmi : 1;
+        unsigned __int64 enclave_interruption : 1;
+        unsigned __int64 reserved : 27;
     };
 };
 
