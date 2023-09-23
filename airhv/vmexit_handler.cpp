@@ -23,7 +23,6 @@
 void vmexit_ept_violation_handler(__vcpu* vcpu);
 void vmexit_unimplemented(__vcpu* vcpu);
 void vmexit_exception_handler(__vcpu* vcpu);
-void vmexit_ept_violation_handler(__vcpu* vcpu);
 void vmexit_cr_handler(__vcpu* vcpu);
 void vmexit_vm_instruction(__vcpu* vcpu);
 void vmexit_triple_fault_handler(__vcpu* vcpu);
@@ -43,6 +42,7 @@ void vmexit_invpcid_handler(__vcpu* vcpu);
 void vmexit_invlpg_handler(__vcpu* vcpu);
 void vmexit_ldtr_access_handler(__vcpu* vcpu);
 void vmexit_gdtr_access_handler(__vcpu* vcpu);
+void vmexit_monitor_trap_flag_handler(__vcpu* vcpu);
 
 void (*exit_handlers[EXIT_REASON_LAST])(__vcpu* guest_registers) =
 {
@@ -83,7 +83,7 @@ void (*exit_handlers[EXIT_REASON_LAST])(__vcpu* guest_registers) =
 	vmexit_failed,									// 34 EXIT_REASON_MSR_LOADING
 	vmexit_unimplemented,							// 35 EXIT_REASON_RESERVED1
 	vmexit_unimplemented,							// 36 EXIT_REASON_MWAIT
-	vmexit_unimplemented,						    // 37 EXIT_REASON_MONITOR_TRAP_FLAG
+	vmexit_monitor_trap_flag_handler,				// 37 EXIT_REASON_MONITOR_TRAP_FLAG
 	vmexit_unimplemented,							// 38 EXIT_REASON_RESERVED2
 	vmexit_unimplemented,							// 39 EXIT_REASON_MONITOR
 	vmexit_unimplemented,							// 40 EXIT_REASON_PAUSE
@@ -116,6 +116,18 @@ void (*exit_handlers[EXIT_REASON_LAST])(__vcpu* guest_registers) =
 	vmexit_unimplemented,							// 67 EXIT_REASON_UMWAIT
 	vmexit_unimplemented							// 68 EXIT_REASON_TPAUSE
 };
+
+void vmexit_monitor_trap_flag_handler(__vcpu* vcpu)
+{
+	hv::set_mtf(false);
+	const auto hooked_entry = vcpu->ept_state->page_to_change;
+	if (hooked_entry)
+	{
+		hooked_entry->original_entry.execute = false;
+		vcpu->ept_state->page_to_change = nullptr;
+		ept::swap_pml1_and_invalidate_tlb(*vcpu->ept_state, hooked_entry->entry_address, hooked_entry->original_entry, invept_type::INVEPT_SINGLE_CONTEXT);
+	}
+}
 
 /// <summary>
 /// sgdt,sidt,lgdt,lidt handler
@@ -425,18 +437,35 @@ void vmexit_ept_violation_handler(__vcpu* vcpu)
 	ept_violation.all = vcpu->vmexit_info.qualification;
 	unsigned __int64 guest_physical_adddress = hv::vmread(GUEST_PHYSICAL_ADDRESS);
 
-	PLIST_ENTRY current = &g_vmm_context->ept_state->hooked_page_list;
-	while (&g_vmm_context->ept_state->hooked_page_list != current->Flink)
+	PLIST_ENTRY current = &vcpu->ept_state->hooked_page_list;
+	while (&vcpu->ept_state->hooked_page_list != current->Flink)
 	{
 		current = current->Flink;
 		__ept_hooked_page_info* hooked_entry = CONTAINING_RECORD(current, __ept_hooked_page_info, hooked_page_list);
 		if (hooked_entry->pfn_of_hooked_page == GET_PFN(guest_physical_adddress))
 		{
-			if ((ept_violation.read_access || ept_violation.write_access) && (!ept_violation.ept_readable || !ept_violation.ept_writeable)) 
-				ept::swap_pml1(hooked_entry->entry_address, hooked_entry->original_entry);
+			if ((ept_violation.read_access || ept_violation.write_access) && (!ept_violation.ept_readable || !ept_violation.ept_writeable))
+			{
+				const auto old_cr3 = hv::swap_context();
+				const auto rip_physical_address = MmGetPhysicalAddress((PVOID)vcpu->vmexit_info.guest_rip).QuadPart;
+				hv::restore_context(old_cr3);
+				if (static_cast<unsigned __int64>(GET_PFN(rip_physical_address)) == hooked_entry->pfn_of_hooked_page)
+				{
+					hv::set_mtf(true);
+					hooked_entry->original_entry.execute = true;
+					vcpu->ept_state->page_to_change = hooked_entry;
+					ept::swap_pml1_and_invalidate_tlb(*vcpu->ept_state, hooked_entry->entry_address, hooked_entry->original_entry, invept_type::INVEPT_SINGLE_CONTEXT);
+				}
+				else
+				{
+					ept::swap_pml1_and_invalidate_tlb(*vcpu->ept_state, hooked_entry->entry_address, hooked_entry->original_entry, invept_type::INVEPT_SINGLE_CONTEXT);
+				}
+			}
 
 			else if (ept_violation.execute_access && (ept_violation.ept_readable || ept_violation.ept_writeable))
-				ept::swap_pml1(hooked_entry->entry_address, hooked_entry->changed_entry);
+			{
+				ept::swap_pml1_and_invalidate_tlb(*vcpu->ept_state, hooked_entry->entry_address, hooked_entry->changed_entry, invept_type::INVEPT_SINGLE_CONTEXT);
+			}
 
 			break;
 		}
@@ -456,7 +485,32 @@ void vmexit_exception_handler(__vcpu* vcpu)
 
 	// Exit Qualification contain the linear address which caused page fault
 	if (interrupt_info.vector == EXCEPTION_VECTOR_PAGE_FAULT)
+	{
 		__writecr2(vcpu->vmexit_info.qualification);
+	}
+	else if (interrupt_info.vector == EXCEPTION_VECTOR_SINGLE_STEP && vcpu->vmexit_info.guest_rflags.trap_flag == false)
+	{
+		PLIST_ENTRY current_hooked_page = &vcpu->ept_state->hooked_page_list;
+		while (&vcpu->ept_state->hooked_page_list != current_hooked_page->Flink)
+		{
+			current_hooked_page = current_hooked_page->Flink;
+			__ept_hooked_page_info* hooked_page_entry = CONTAINING_RECORD(current_hooked_page, __ept_hooked_page_info, hooked_page_list);
+
+			PLIST_ENTRY current_hooked_function = &hooked_page_entry->hooked_functions_list;
+			while (&hooked_page_entry->hooked_functions_list != current_hooked_function->Flink)
+			{
+				current_hooked_function = current_hooked_function->Flink;
+				__ept_hooked_function_info* hooked_function_entry =
+					CONTAINING_RECORD(current_hooked_function, __ept_hooked_function_info, hooked_function_list);
+
+				if (hooked_function_entry->original_function_va == (void*)vcpu->vmexit_info.guest_rip)
+				{
+					hv::vmwrite(GUEST_RIP, hooked_function_entry->hooked_function_va);
+					return;
+				}
+			}
+		}
+	}
 
 	hv::inject_interruption(interrupt_info.vector, interrupt_info.interruption_type, error_code, interrupt_info.error_code_valid);
 }
@@ -515,7 +569,7 @@ void vmexit_cpuid_handler(__vcpu* vcpu)
 	vcpu->vmexit_info.guest_registers->rbx = cpuid_reg.ebx;
 	vcpu->vmexit_info.guest_registers->rcx = cpuid_reg.ecx;
 	vcpu->vmexit_info.guest_registers->rdx = cpuid_reg.edx;
-
+	
 	adjust_rip(vcpu);
 }
 
@@ -1177,7 +1231,7 @@ void vmexit_rdtsc_handler(__vcpu* vcpu)
 /// <returns></returns>
 unsigned __int64 return_rsp_for_vmxoff()
 {
-	return g_vmm_context->vcpu_table[KeGetCurrentProcessorNumber()]->vmx_off_state.guest_rsp;
+	return g_vmm_context->vcpu_table[KeGetCurrentProcessorNumberEx(NULL)]->vmx_off_state.guest_rsp;
 }
 
 /// <summary>
@@ -1186,7 +1240,7 @@ unsigned __int64 return_rsp_for_vmxoff()
 /// <returns></returns>
 unsigned __int64 return_rip_for_vmxoff()
 {
-	return g_vmm_context->vcpu_table[KeGetCurrentProcessorNumber()]->vmx_off_state.guest_rip;
+	return g_vmm_context->vcpu_table[KeGetCurrentProcessorNumberEx(NULL)]->vmx_off_state.guest_rip;
 }
 
 void vmexit_cr_handler(__vcpu* vcpu)
@@ -1417,7 +1471,7 @@ void vmexit_cr_handler(__vcpu* vcpu)
 /// <returns> status </returns>
 bool vmexit_handler(__vmexit_guest_registers* guest_registers)
 {
-	__vcpu* vcpu = g_vmm_context->vcpu_table[KeGetCurrentProcessorNumber()];
+	__vcpu* vcpu = g_vmm_context->vcpu_table[KeGetCurrentProcessorNumberEx(NULL)];
 
 	guest_registers->rsp = hv::vmread(GUEST_RSP);
 

@@ -4,6 +4,7 @@
 #include "common.h"
 #include "log.h"
 #include "allocators.h"
+#include "spinlock.h"
 
 namespace pool_manager 
 {
@@ -26,7 +27,15 @@ namespace pool_manager
             }
             RtlSecureZeroMemory(single_pool, sizeof(__pool_table));
 
-            single_pool->address = ::allocate_pool<void*>(size);
+            if (size % PAGE_SIZE == 0)
+            {
+                single_pool->address = ::allocate_contignous_memory<void*>(size);
+            }
+            else
+            {
+                single_pool->address = ::allocate_pool<void*>(size);
+            }
+
             if (single_pool->address == nullptr)
             {
                 LogError("Memory allocation failed");
@@ -53,7 +62,7 @@ namespace pool_manager
     /// <returns></returns>
     bool request_allocation(unsigned __int64 size, unsigned __int32 count, allocation_intention intention)
     {
-        spinlock::lock(&g_vmm_context->pool_manager->lock_for_request_allocation);
+        spinlock allocation_lock(&g_vmm_context->pool_manager->lock_for_request_allocation);
 
         for (unsigned __int64 i = 0; i < 10; i++)
         {
@@ -67,7 +76,6 @@ namespace pool_manager
             }
         }
 
-        spinlock::unlock(&g_vmm_context->pool_manager->lock_for_request_allocation);
         return g_vmm_context->pool_manager->is_request_for_allocation_recived;
     }
 
@@ -147,25 +155,31 @@ namespace pool_manager
 
         InitializeListHead(g_vmm_context->pool_manager->list_of_allocated_pools);
 
-        if (request_allocation(sizeof(__ept_dynamic_split), 100, INTENTION_SPLIT_PML2) == false)
+        if (request_allocation(sizeof(__ept_dynamic_split), g_vmm_context->processor_count * 50, INTENTION_SPLIT_PML2) == false)
         {
             LogError("Pool mangaer request allocation Failed");
             return false;
         }
 
-        if (request_allocation(sizeof(__ept_hooked_page_info), 100, INTENTION_TRACK_HOOKED_PAGES) == false)
+        if (request_allocation(sizeof(__ept_hooked_page_info), g_vmm_context->processor_count * 50, INTENTION_TRACK_HOOKED_PAGES) == false)
         {
             LogError("Pool mangaer request allocation Failed");
             return false;
         }
 
-        if (request_allocation(100, 100, INTENTION_EXEC_TRAMPOLINE) == false)
+        if (request_allocation(100, g_vmm_context->processor_count * 50, INTENTION_EXEC_TRAMPOLINE) == false)
         {
             LogError("Pool mangaer request allocation Failed");
             return false;
         }
 
-        if (request_allocation(sizeof(__ept_hooked_function_info), 100, INTENTION_TRACK_HOOKED_FUNCTIONS) == false)
+        if (request_allocation(sizeof(__ept_hooked_function_info), g_vmm_context->processor_count * 50, INTENTION_TRACK_HOOKED_FUNCTIONS) == false)
+        {
+            LogError("Pool mangaer request allocation Failed");
+            return false;
+        }
+
+        if (request_allocation(PAGE_SIZE, g_vmm_context->processor_count * 50, INTENTION_FAKE_PAGE_CONTENTS) == false)
         {
             LogError("Pool mangaer request allocation Failed");
             return false;
@@ -179,20 +193,25 @@ namespace pool_manager
     void uninitialize()
     {
         PLIST_ENTRY current = 0;
-
         if (g_vmm_context->pool_manager->list_of_allocated_pools != nullptr)
         {
-            current = g_vmm_context->pool_manager->list_of_allocated_pools;
-
-            while (g_vmm_context->pool_manager->list_of_allocated_pools != current->Flink)
+            current = g_vmm_context->pool_manager->list_of_allocated_pools->Flink;
+            while (g_vmm_context->pool_manager->list_of_allocated_pools != current)
             {
-                current = current->Flink;
-
                 // Get the head of the record
                 __pool_table* pool_table = (__pool_table*)CONTAINING_RECORD(current, __pool_table, pool_list);
 
+                current = current->Flink;
+
                 // Free the alloocated buffer
-                free_pool(pool_table->address);
+                if (pool_table->size % PAGE_SIZE == 0)
+                {
+                    free_contignous_memory(pool_table->address);
+                }
+                else
+                {
+                    free_pool(pool_table->address);
+                }
 
                 // Free the record itself
                 free_pool(pool_table);
@@ -216,7 +235,7 @@ namespace pool_manager
         PLIST_ENTRY current = 0;
         current = g_vmm_context->pool_manager->list_of_allocated_pools;
 
-        spinlock::lock(&g_vmm_context->pool_manager->lock_for_reading_pool);
+        spinlock pool_lock(&g_vmm_context->pool_manager->lock_for_reading_pool);
         while (g_vmm_context->pool_manager->list_of_allocated_pools != current->Flink)
         {
             current = current->Flink;
@@ -232,8 +251,6 @@ namespace pool_manager
                 break;
             }
         }
-
-        spinlock::unlock(&g_vmm_context->pool_manager->lock_for_reading_pool);
     }
 
     inline const char* intention_to_string(allocation_intention intention)
@@ -256,7 +273,7 @@ namespace pool_manager
     {
         PLIST_ENTRY current = g_vmm_context->pool_manager->list_of_allocated_pools;
 
-        spinlock::lock(&g_vmm_context->pool_manager->lock_for_reading_pool);
+        spinlock pool_lock(&g_vmm_context->pool_manager->lock_for_reading_pool);
 
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "-----------------------------------POOL MANAGER DUMP-----------------------------------\r\n");
 
@@ -273,7 +290,5 @@ namespace pool_manager
         }
 
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "-----------------------------------POOL MANAGER DUMP-----------------------------------\r\n");
-
-        spinlock::unlock(&g_vmm_context->pool_manager->lock_for_reading_pool);
     }
 }

@@ -9,7 +9,8 @@ namespace pool_manager
         INTENTION_TRACK_HOOKED_PAGES,
         INTENTION_EXEC_TRAMPOLINE,
         INTENTION_SPLIT_PML2,
-        INTENTION_TRACK_HOOKED_FUNCTIONS
+        INTENTION_TRACK_HOOKED_FUNCTIONS,
+        INTENTION_FAKE_PAGE_CONTENTS,
     };
 
     struct __request_new_allocation
@@ -91,7 +92,7 @@ namespace pool_manager
         __pool_table* pool_table;
         current = g_vmm_context->pool_manager->list_of_allocated_pools;
 
-        spinlock::lock(&g_vmm_context->pool_manager->lock_for_reading_pool);
+        spinlock pool_lock(&g_vmm_context->pool_manager->lock_for_reading_pool);
 
         while (g_vmm_context->pool_manager->list_of_allocated_pools != current->Flink)
         {
@@ -108,8 +109,6 @@ namespace pool_manager
                 break;
             }
         }
-
-        spinlock::unlock(&g_vmm_context->pool_manager->lock_for_reading_pool);
 
         //
         // If pool which we got is recycled then we don't allocate
